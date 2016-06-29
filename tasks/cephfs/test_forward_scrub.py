@@ -137,6 +137,8 @@ class TestForwardScrub(CephFSTestCase):
         self.mount_a.run_shell(["dd", "if=/dev/urandom",
                                 "of=./parent/unflushed/jfile",
                                 "bs=1M", "count=8"])
+
+
         inos["./parent/unflushed"] = self.mount_a.path_to_ino("./parent/unflushed")
         inos["./parent/unflushed/jfile"] = self.mount_a.path_to_ino("./parent/unflushed/jfile")
         self.mount_a.umount_wait()
@@ -194,3 +196,47 @@ class TestForwardScrub(CephFSTestCase):
         self.fs.wait_for_daemons()
         self.mount_a.mount()
         self._validate_linkage(inos)
+
+    def stash_inotable(self):
+        # Get all active ranks
+        ranks = self.fs.get_all_mds_rank()
+
+        inotable_dict = {}
+        for rank in ranks:
+            inotable_oid = "mds{rank:d}_".format(rank=rank) + "inotable"
+            print "Trying to fetch inotable object: " + inotable_oid
+
+            #self.fs.get_metadata_object("InoTable", "mds0_inotable")
+            inotable_raw = self.fs.get_metadata_object_raw(inotable_oid)
+            inotable_dict[inotable_oid] = inotable_raw
+        return inotable_dict
+
+    def test_inotable_sync(self):
+        self.mount_a.write_n_mb("file1_sixmegs", 6)
+
+        # Flush journal
+        self.mount_a.umount_wait()
+        self.fs.mds_asok(["flush", "journal"])
+
+        inotable_copy = self.stash_inotable()
+
+        self.mount_a.mount()
+    
+        self.mount_a.write_n_mb("file2_sixmegs", 6)
+        self.mount_a.write_n_mb("file3_sixmegs", 6)
+
+        # Flush journal
+        self.mount_a.umount_wait()
+        self.fs.mds_asok(["flush", "journal"])
+
+        self.mount_a.umount_wait()
+
+        # Revert to old inotable.
+        for key, value in inotable_copy.iteritems():
+           self.fs.put_metadata_object_raw(key, value)
+
+        # Run a tagging forward scrub
+        tag = "mytag123"
+        self.fs.mds_asok(["tag", "path", "/", tag])
+        self.fs.data_scan(["scan_extents", self.fs.get_data_pool_name()])
+        self.fs.data_scan(["scan_inodes", self.fs.get_data_pool_name()])
