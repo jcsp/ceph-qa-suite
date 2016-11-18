@@ -794,3 +794,76 @@ class TestStrays(CephFSTestCase):
         path=self.mount_a.mountpoint,
         file_count=LOW_LIMIT
         )))
+
+
+class TestStraysStandby(CephFSTestCase):
+    MDSS_REQUIRED = 2
+    REQUIRE_FILESYSTEM = False
+
+    def test_standby_trim(self):
+        """
+        That where a standby replay exists for a rank, the standby
+        does not keep dentries around for purged strays (#16919)
+        """
+
+        use_daemons = sorted(self.mds_cluster.mds_ids[0:2])
+        mds_a, mds_b = use_daemons
+
+        self.set_conf("mds.{0}".format(mds_b),
+                      "mds_standby_for_name", mds_a)
+        self.set_conf("mds.{0}".format(mds_b), "mds_standby_replay", "true")
+
+        fs = self.mds_cluster.newfs("alpha")
+        self.mds_cluster.mds_restart(mds_a)
+        fs.wait_for_daemons()
+
+        self.mds_cluster.mds_restart(mds_b)
+        self.wait_for_daemon_start([mds_b])
+
+        def get_stats():
+            dns_a = fs.mds_asok(['perf', 'dump', 'mds'], mds_a)['mds']['inodes']
+            dns_b = fs.mds_asok(['perf', 'dump', 'mds'], mds_b)['mds']['inodes']
+
+            return dns_a, dns_b
+
+        # Active has 10 stray dir dentries, standby has none
+        self.assertTupleEqual((10, 0), get_stats())
+
+        self.mount_a.mount()
+        self.mount_a.run_shell(["mkdir", "subdir"])
+        self.mount_a.run_shell(["touch", "subdir/one"])
+        self.mount_a.run_shell(["touch", "subdir/two"])
+
+        # Three more dentries in both active and standby
+        self.wait_until_equal(
+            get_stats,
+            (13, 3),
+            30
+        )
+
+        self.mount_a.run_shell(["rm", "-rf", "subdir"])
+        self.mount_a.umount_wait()
+
+        # Double flush to finish purging and trimming first the files...
+        fs.mds_asok(["flush", "journal"], mds_a)
+        self.wait_until_true(
+            lambda: fs.mds_asok(['perf', 'dump', 'mds_cache']
+                                     )['mds_cache']['num_strays'] <= 1,
+            timeout=30
+        )
+        # ...then the directory.
+        fs.mds_asok(["flush", "journal"], mds_a)
+        self.wait_until_equal(
+            lambda: fs.mds_asok(['perf', 'dump', 'mds_cache']
+                                     )['mds_cache']['num_strays'],
+            0,
+            timeout=30
+        )
+
+        # Overall inode counts should now have returned to the baseline:
+        # active MDS has its root and strays, and standby has nothing.
+        self.wait_until_equal(
+            get_stats,
+            (10, 0),
+            30
+        )
