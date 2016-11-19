@@ -867,3 +867,67 @@ class TestStraysStandby(CephFSTestCase):
             (10, 0),
             30
         )
+
+
+class TestMultiMDSStrays(CephFSTestCase):
+    MDSS_REQUIRED = 2
+
+    def test_stopping(self):
+        """
+        That when MDS caches contain references to strays on ranks
+        other than themselves, they are able to correctly trim
+        and deactivate when requested to.
+        """
+        # Set up two MDSs
+        self.fs.mon_manager.raw_cluster_cmd_result('mds', 'set', "allow_multimds",
+                                                   "true", "--yes-i-really-mean-it")
+        self.fs.mon_manager.raw_cluster_cmd_result('mds', 'set', "max_mds", "2")
+
+        # See that we have two active MDSs
+        self.wait_until_equal(lambda: len(self.fs.get_active_names()), 2, 30,
+                              reject_fn=lambda v: v > 2 or v < 1)
+
+        active_mds_names = self.fs.get_active_names()
+        rank_0_id = active_mds_names[0]
+        rank_1_id = active_mds_names[1]
+        log.info("Ranks 0 and 1 are {0} and {1}".format(
+            rank_0_id, rank_1_id))
+
+        # Induce some cross-rank stray references by repeatedly mounting
+        # and unmounting clients while creating hardlinks.  Each client
+        # mount will choose a new random MDS to talk to, so statistically
+        # we are bound to end up with some cross-MDS references.
+
+        self.mount_a.run_shell(["mkdir", "origin"])
+        self.mount_a.write_n_mb("origin/data", 8)
+
+        self.mount_a.run_shell(["mkdir", "ref1"])
+        self.mount_a.run_shell(["ln", "origin/data", "ref1/linkto"])
+
+        result = self.fs.mds_asok(["export", "dir", "/origin", "1"], rank_0_id)
+        self.assertEqual(result["return_code"], 0)
+        result = self.fs.mds_asok(["export", "dir", "/ref1", "1"], rank_0_id)
+        self.assertEqual(result["return_code"], 0)
+
+        self.mount_a.run_shell(["rm", "-f", "origin/data"])
+        self.mount_a.umount_wait()
+
+        for n in range(2, 12):
+            dir = "ref{0}".format(n)
+            with self.mount_a.mounted():
+                self.mount_a.run_shell(["mkdir", dir])
+                self.mount_a.run_shell(["ln", "ref{0}/linkto".format(n - 1),
+                                        "{0}/linkto".format(dir)])
+
+        self.assertTrue(False)
+
+        # Shut down rank 1
+        self.fs.mon_manager.raw_cluster_cmd_result('mds', 'set', "max_mds", "1")
+        self.fs.mon_manager.raw_cluster_cmd_result('mds', 'deactivate', "1")
+
+        # Wait til we get to a single active MDS mdsmap state
+        def is_stopped():
+            mds_map = self.fs.get_mds_map()
+            return 1 not in [i['rank'] for i in mds_map['info'].values()]
+
+        self.wait_until_true(is_stopped, timeout=120)
